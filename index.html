@@ -141,7 +141,7 @@ const OWL_MAP = Object.fromEntries(OWL_Q.map(q=>[q[0],{cz:q[1],weapon:!!q[2]}]))
 let objDet=null, poseDet=null, running=false, stream=null, facing='environment';
 let frame=0, lastObjs=[], lastT=0, fpsAvg=0, audio=null, wakeLock=null, bannerTimer=null;
 const people = new Map();
-let owl=null, owlReady=false, owlBusy=false, owlRR=0, owlHits=[], owlMs=0, owlSent=0;
+let owl=null, owlReady=false, owlBusy=false, owlRR=0, owlHits=[], owlMs=0, owlSent=0, owlStart=0, owlDone=0, owlTop='', sceneAlertAt=0;
 
 function setStatus(t, live){ $('statusText').textContent=t; $('status').classList.toggle('live',!!live); }
 function mstat(id, t, cls){
@@ -217,30 +217,50 @@ function startOwl(){
     if(m.type==='progress'){ $('owlBar').style.width=m.pct.toFixed(0)+'%'; mstat('mOwl','stahuji '+m.pct.toFixed(0)+' % z '+m.mb+' MB'); }
     else if(m.type==='ready'){ owlReady=true; $('owlBar').style.width='100%'; mstat('mOwl','běží','ok'); }
     else if(m.type==='error'){ mstat('mOwl','chyba: '+m.msg,'err'); }
-    else if(m.type==='result'){ owlBusy=false; owlMs = owlMs? owlMs*0.7+m.ms*0.3 : m.ms; handleOwl(m); }
+    else if(m.type==='result'){
+      owlBusy=false; owlDone++; owlMs = owlMs? owlMs*0.7+m.ms*0.3 : m.ms;
+      if(m.err) owlTop='chyba: '+m.err;
+      else { const b=(m.out||[]).slice().sort((a,b)=>b.score-a.score)[0];
+        owlTop = b ? (OWL_MAP[b.label]?.cz||b.label)+' '+Math.round(b.score*100)+' %' : 'nic'; }
+      handleOwl(m); updOwlHud();
+    }
   };
   owl.onerror = e=>{ mstat('mOwl','chyba vlákna: '+(e.message||'neznámá'),'err'); };
   owl.postMessage({type:'load'});
 }
 
 /* vybere dalšího člověka (nebo celý obraz) a pošle výřez na kontrolu zbraní */
+function updOwlHud(){
+  const h=$('hOwl'); h.className='ok';
+  h.textContent='Zbraně: '+owlDone+' kontrol · '+(owlMs/1000).toFixed(1)+' s · vidí: '+owlTop;
+}
 function scheduleOwl(){
+  // hlídání zaseknutí: když model neodpoví do 25 s, restartuje se
+  if(owlBusy && now_()-owlStart>25000){
+    try{ owl.terminate(); }catch(e){}
+    owlBusy=false; owlReady=false; mstat('mOwl','model zamrzl, restartuji…','err'); startOwl(); return;
+  }
   if(!owlReady || owlBusy || !video.videoWidth) return;
   const vw=video.videoWidth, vh=video.videoHeight;
   const list=[...people.values()].filter(s=>s.box && now_()-s.lastSeen<500)
     .sort((a,b)=>(b.priority||0)-(a.priority||0));
-  let crop;
-  owlSent++;
-  if(list.length && owlSent%4!==0){ // každá 4. kontrola je celý obraz (dlouhé zbraně přesahují postavu)
+  let crop; const n=owlSent++;
+  const kind = !list.length ? ['full','top','bottom'][n%3]
+             : ['person','full','person','top','person','bottom'][n%6];
+  if(kind==='person'){
     // přednost má ten, kdo vypadá jako by mířil nebo je oranžový
     const s = list.find(p=>p.priority>0) || list[owlRR++ % list.length];
-    const b=s.box, padX=b.w*0.7, padY=b.h*0.15;
-    crop={x:Math.max(0,b.x-padX), y:Math.max(0,b.y-padY)};
-    crop.w=Math.min(vw-crop.x, b.w+2*padX); crop.h=Math.min(vh-crop.y, b.h+2*padY);
+    const b=s.box;
+    // zbraň bývá před tělem: výřez rozšíříme hlavně ve směru, kam se člověk dívá
+    const front = b.w*1.6, back = b.w*0.35, padY=b.h*0.15;
+    const dir = s.facing||0; // -1 vlevo, 1 vpravo, 0 neznámo/čelem
+    const padL = dir<0? front : dir>0? back : b.w*0.9, padR = dir>0? front : dir<0? back : b.w*0.9;
+    crop={x:Math.max(0,b.x-padL), y:Math.max(0,b.y-padY)};
+    crop.w=Math.min(vw-crop.x, b.w+padL+padR); crop.h=Math.min(vh-crop.y, b.h+2*padY);
     crop.pid=s.id;
-  } else {
-    crop={x:0,y:0,w:vw,h:vh,pid:null};
-  }
+  } else if(kind==='top'){ crop={x:0,y:0,w:vw,h:Math.round(vh*0.6),pid:null}; }
+  else if(kind==='bottom'){ crop={x:0,y:Math.round(vh*0.4),w:vw,h:vh-Math.round(vh*0.4),pid:null}; }
+  else { crop={x:0,y:0,w:vw,h:vh,pid:null}; }
   const scale=Math.min(1, 640/Math.max(crop.w,crop.h));
   const w=Math.max(32,Math.round(crop.w*scale)), h=Math.max(32,Math.round(crop.h*scale));
   const c=scheduleOwl.c || (scheduleOwl.c=document.createElement('canvas'));
@@ -251,7 +271,7 @@ function scheduleOwl(){
   for(let i=0,j=0;i<rgba.length;i+=4,j+=3){ rgb[j]=rgba[i]; rgb[j+1]=rgba[i+1]; rgb[j+2]=rgba[i+2]; }
   crop.sx=crop.w/w; crop.sy=crop.h/h;
   const th = 0.22 - sens()*0.016; // citlivost 1 → 0.20, 8 → 0.09, 10 → 0.06
-  owlBusy=true;
+  owlBusy=true; owlStart=now_();
   owl.postMessage({type:'detect', buf:rgb.buffer, w, h, labels:OWL_LABELS, th, crop},[rgb.buffer]);
 }
 
@@ -263,6 +283,19 @@ function handleOwl(m){
       box:{x:c.x+o.box.xmin*c.sx, y:c.y+o.box.ymin*c.sy, w:(o.box.xmax-o.box.xmin)*c.sx, h:(o.box.ymax-o.box.ymin)*c.sy}};
   });
   owlHits = owlHits.filter(h=>t-h.t<2500).concat(hits.filter(h=>h.weapon || h.score>0.15));
+  // zbraň kdekoli v záběru (i položená, bez člověka)
+  const sceneTh = 0.30 - sens()*0.02;
+  const best = hits.filter(h=>h.weapon && h.score>=sceneTh).sort((a,b)=>b.score-a.score)[0];
+  if(best){
+    const held=[...people.values()].some(s=>s.box && overlap(best.box,s.box)>0.4*best.box.w*best.box.h);
+    if(!held && t-sceneAlertAt>10000){
+      sceneAlertAt=t;
+      const text='Pozor: '+best.name+' v záběru';
+      const b=$('banner'); b.textContent=text; b.hidden=false;
+      clearTimeout(bannerTimer); bannerTimer=setTimeout(()=>b.hidden=true,6000);
+      beep(); logEvent(text,['zbraň mimo ruce ('+Math.round(best.score*100)+' %)'],best.box);
+    }
+  }
   // přiřaď zbraně lidem
   for(const s of people.values()){
     if(!s.box) continue;
@@ -375,26 +408,33 @@ function angle(a,b,c){ // úhel v bodě b
   return Math.acos(Math.max(-1,Math.min(1,(v1.x*v2.x+v1.y*v2.y)/d)))*180/Math.PI;
 }
 
-/* Rozpozná míření podle postoje: obouruč na kameru, natažená paže do strany, držení dlouhé zbraně */
+/* Rozpozná míření podle postoje – zepředu, z boku i zezadu */
 function aimPose(kp, H){
-  const ls=kp.left_shoulder, rs=kp.right_shoulder, lw=kp.left_wrist, rw=kp.right_wrist;
-  if(!ls||!rs) return null;
-  const sw=Math.max(dist(ls,rs), H*0.12), shY=(ls.y+rs.y)/2, midX=(ls.x+rs.x)/2;
-  const nose=kp.nose;
-  const atShoulder=w=>w && w.y>shY-H*0.14 && w.y<shY+H*0.12;
-  // 1) obouruč směrem do kamery: ruce u sebe, ve výšce ramen/hrudi, před tělem
-  if(lw&&rw && atShoulder(lw) && atShoulder(rw) && dist(lw,rw)<sw*0.6 && Math.abs((lw.x+rw.x)/2-midX)<sw*0.9)
-    return 'míří obouruč směrem ke kameře';
-  // 2) natažená paže do strany ve výšce ramen
-  for(const [s,e,w] of [[ls,kp.left_elbow,lw],[rs,kp.right_elbow,rw]]){
-    if(s&&e&&w && atShoulder(w) && Math.abs(w.y-s.y)<H*0.1 && dist(w,s)>sw*0.9 && angle(s,e,w)>145)
+  const ls=kp.left_shoulder, rs=kp.right_shoulder, le=kp.left_elbow, re=kp.right_elbow, lw=kp.left_wrist, rw=kp.right_wrist, nose=kp.nose;
+  if(!ls && !rs) return null;
+  const sh = ls&&rs ? {x:(ls.x+rs.x)/2, y:(ls.y+rs.y)/2} : (ls||rs);
+  const sw = ls&&rs ? Math.max(dist(ls,rs), H*0.12) : H*0.18; // z boku jsou ramena u sebe
+  const top = nose ? nose.y - H*0.02 : sh.y - H*0.15;
+  const raised = w => w && w.y>top && w.y<sh.y+H*0.16;   // ruka mezi obličejem a hrudí
+  // 1) zepředu: obě ruce u sebe před tělem
+  const elbowsWide = le&&re && ls&&rs && (Math.min(le.x,re.x) < Math.min(ls.x,rs.x)-sw*0.6 || Math.max(le.x,re.x) > Math.max(ls.x,rs.x)+sw*0.6);
+  if(lw&&rw && raised(lw)&&raised(rw) && !elbowsWide && dist(lw,rw)<sw*0.7 && Math.abs((lw.x+rw.x)/2-sh.x)<sw*1.0)
+    return 'míří obouruč (zepředu)';
+  // 2) z boku: obě ruce zvednuté na stejné straně těla, jedna vpředu
+  if(lw&&rw && raised(lw)&&raised(rw)){
+    const dl=lw.x-sh.x, dr=rw.x-sh.x;
+    if(Math.sign(dl)===Math.sign(dr) && Math.max(Math.abs(dl),Math.abs(dr))>sw*0.6)
+      return 'obě ruce vpředu ve výšce ramen (míření z boku)';
+  }
+  // 3) jedna natažená paže ve výšce ramen (pistole jednoruč)
+  for(const [s,e,w] of [[ls,le,lw],[rs,re,rw]]){
+    if(s&&e&&w && raised(w) && Math.abs(w.y-s.y)<H*0.12 && dist(w,s)>sw*0.9 && angle(s,e,w)>140)
       return 'natažená paže ve výšce ramen (míření)';
   }
-  // 3) dlouhá zbraň: jedna ruka u ramene/obličeje, druhá vpředu ve stejné výšce na stejné straně
-  if(lw&&rw && atShoulder(lw) && atShoulder(rw)){
-    const near=w=>dist(w,ls)<H*0.12||dist(w,rs)<H*0.12||(nose&&dist(w,nose)<H*0.12);
-    const sameSide=Math.sign(lw.x-midX)===Math.sign(rw.x-midX);
-    if((near(lw)||near(rw)) && sameSide && Math.abs(lw.x-rw.x)>sw*0.7) return 'postoj jako při míření puškou';
+  // 4) zezadu: lokty zvednuté do výšky ramen a směřují dopředu (ruce nejsou vidět)
+  if(ls&&rs&&le&&re && Math.abs(le.y-sh.y)<H*0.1 && Math.abs(re.y-sh.y)<H*0.1){
+    const minX=Math.min(ls.x,rs.x)-sw*0.5, maxX=Math.max(ls.x,rs.x)+sw*0.5;
+    if(le.x>minX && le.x<maxX && re.x>minX && re.x<maxX) return 'lokty zvednuté před tělem (možné míření, pohled zezadu)';
   }
   return null;
 }
@@ -411,6 +451,15 @@ function analyse(poses, objs, now, dt){
     if(!s){ s={id, risk:0, reasons:new Map(), prev:null, alertedAt:0, wideSince:0, aimSince:0}; people.set(id,s); }
     s.box=box; s.lastSeen=now; s.weapon=null; s.priority=0;
     const kp=kpMap(p), H=Math.max(box.h,40);
+    // kam se člověk dívá / kam má ruce (pro výřez zbraňového modelu)
+    if(kp.left_shoulder&&kp.right_shoulder){
+      const mx=(kp.left_shoulder.x+kp.right_shoulder.x)/2, sw=Math.abs(kp.left_shoulder.x-kp.right_shoulder.x);
+      const wr=[kp.left_wrist,kp.right_wrist].filter(Boolean);
+      const wx=wr.length? wr.reduce((a,w)=>a+w.x,0)/wr.length : null;
+      if(kp.nose && Math.abs(kp.nose.x-mx)>sw*0.35) s.facing=Math.sign(kp.nose.x-mx);
+      else if(wx!==null && Math.abs(wx-mx)>sw*0.6) s.facing=Math.sign(wx-mx);
+      else s.facing=0;
+    } else s.facing=0;
     const add=(key,label,val)=>{ s.risk+=val*k; s.reasons.set(key,{label,t:now}); };
 
     // a) rychlý model: nůž / pálka u ruky
